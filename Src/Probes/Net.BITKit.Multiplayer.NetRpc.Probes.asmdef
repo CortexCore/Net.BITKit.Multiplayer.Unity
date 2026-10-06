@@ -1,0 +1,7 @@
+{
+  "name": "Net.BITKit.Multiplayer.NetRpc.Probes",
+  "rootNamespace": "BITKit.Multiplayer.NetRpc.Probes",
+  "references": ["Net.BITKit.Multiplayer", "Net.BITKit.Multiplayer.Contracts", "UniTask"],
+  "autoReferenced": false,
+  "noEngineReferences": true
+}

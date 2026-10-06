@@ -1,0 +1,8 @@
+{
+  "name": "Net.BITKit.Multiplayer.Unity",
+  "rootNamespace": "BITKit.Multiplayer.Unity",
+  "references": ["Net.BITKit.Multiplayer", "Net.BITKit.Multiplayer.Contracts", "UniTask"],
+  "overrideReferences": true,
+  "precompiledReferences": ["Microsoft.Extensions.DependencyInjection.dll", "Microsoft.Extensions.DependencyInjection.Abstractions.dll"],
+  "autoReferenced": true
+}

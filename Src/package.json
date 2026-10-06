@@ -1,0 +1,11 @@
+{
+  "name": "net.bitkit.multiplayer.unity",
+  "version": "0.1.0",
+  "displayName": "BITKit Multiplayer Unity",
+  "description": "Unity sessions, identities, scene objects and prefab lifecycle for BITKit Multiplayer.",
+  "unity": "2022.3",
+  "dependencies": {
+    "net.bitkit.multiplayer": "0.1.0",
+    "com.cysharp.unitask": "2.5.10"
+  }
+}

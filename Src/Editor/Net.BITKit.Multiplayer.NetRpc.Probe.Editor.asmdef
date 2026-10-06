@@ -1,0 +1,8 @@
+{
+  "name": "Net.BITKit.Multiplayer.NetRpc.Probe.Editor",
+  "references": ["Net.BITKit.Multiplayer", "Net.BITKit.Multiplayer.Contracts", "Net.BITKit.Multiplayer.Transport", "Net.BITKit.Multiplayer.Unity", "Net.BITKit.Multiplayer.NetRpc.Probes", "UniTask"],
+  "includePlatforms": ["Editor"],
+  "overrideReferences": true,
+  "precompiledReferences": ["Microsoft.Extensions.DependencyInjection.dll", "Microsoft.Extensions.DependencyInjection.Abstractions.dll", "MessagePack.dll", "MessagePack.Annotations.dll"],
+  "autoReferenced": false
+}
