@@ -13,6 +13,7 @@ namespace BITKit.Multiplayer.Unity
     public sealed class UnityNetRpcDispatcher : IDisposable
     {
         private readonly int _thread = Thread.CurrentThread.ManagedThreadId;
+        private readonly SynchronizationContext _synchronizationContext = SynchronizationContext.Current;
         private readonly Queue<Action> _queue = new Queue<Action>();
         private readonly Queue<(object Owner, Action Deliver)> _control = new Queue<(object, Action)>();
         private readonly HashSet<object> _controlOwners = new HashSet<object>();
@@ -24,6 +25,36 @@ namespace BITKit.Multiplayer.Unity
         public int MaximumBytes { get; } = 4 * 1024 * 1024;
         public int MainThreadId => _thread;
         internal bool IsDisposed { get { lock (_gate) return _disposed; } }
+        internal void VerifyMainThread()
+        {
+            if (Thread.CurrentThread.ManagedThreadId != _thread)
+                throw new InvalidOperationException("Unity network objects require the session main thread.");
+        }
+
+        // Asset loaders and application initialization may complete off-thread. Always return their
+        // continuation to this session's Pump before touching Unity or registering engine components.
+        // This deliberately has no cancellation: even a cancelled load must release its late instance.
+        internal UniTask SwitchToMainThreadAsync()
+        {
+            if (Thread.CurrentThread.ManagedThreadId == _thread) return UniTask.CompletedTask;
+            var completion = new UniTaskCompletionSource();
+            Action complete = () =>
+            {
+                try { VerifyMainThread(); completion.TrySetResult(); }
+                catch (Exception error) { completion.TrySetException(error); }
+            };
+            if (Post(complete, 0)) return completion.Task;
+
+            // A disposed/full session queue cannot own a late asset-release continuation. Unity's
+            // captured context survives that session and is used only for this engine cleanup path.
+            if (_synchronizationContext != null &&
+                _synchronizationContext.GetType() != typeof(SynchronizationContext))
+                _synchronizationContext.Post(_ => complete(), null);
+            else
+                completion.TrySetException(new InvalidOperationException(
+                    "Unity main-thread dispatcher is unavailable; keep Pump active until asset loads finish."));
+            return completion.Task;
+        }
         public int PendingCount { get { lock (_gate) return _queue.Count + _control.Count; } }
         public int PendingBytes { get { lock (_gate) return _bytes; } }
         internal void RegisterControl(object owner)
