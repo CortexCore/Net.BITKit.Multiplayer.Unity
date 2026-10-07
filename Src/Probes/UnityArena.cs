@@ -4,7 +4,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Cysharp.Threading.Tasks;
 
-[assembly: BITKit.Multiplayer.NetRpcBackend]
 
 namespace BITKit.Multiplayer.NetRpc.Probes
 {

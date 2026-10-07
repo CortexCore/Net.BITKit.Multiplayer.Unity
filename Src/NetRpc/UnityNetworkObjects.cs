@@ -77,7 +77,6 @@ namespace BITKit.Multiplayer.Unity
     /// One world-generation roster. The Host owns IDs/lifecycle; Clients resolve NetworkIdentity prefab addresses
     /// and bind authored SceneIdentity objects before NetEntity component synchronization is exposed.
     /// </summary>
-    [global::BITKit.Multiplayer.NetRpcBackend]
     public sealed class UnityNetworkObjects : IDisposable
     {
         private readonly RpcContextService _runtime;

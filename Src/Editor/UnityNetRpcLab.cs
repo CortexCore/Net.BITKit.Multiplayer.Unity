@@ -148,7 +148,7 @@ namespace BITKit.Multiplayer.EditorNetRpc
         private static UnityNetRpcAdapter CreateSession(UnityArenaWorld world, bool host, out ServiceProvider provider)
         {
             var services = new ServiceCollection().AddSingleton(world).AddSingleton<IEntitiesService, EntitiesService>();
-            services.AddNetRpcObject<UnityArenaCommands>();
+            services.AddSingleton<UnityArenaCommands>();
             if (host) services.AddNetRpcService<IUnityArena, UnityArenaService>(); else services.AddRemoteInterface<IUnityArena>();
             services.AddSingleton<IRemoteInterfaceFactory, PrecompiledRemoteInterfaceFactory>();
             services.AddNetRpcRuntime(host, 0x554E495459UL);
