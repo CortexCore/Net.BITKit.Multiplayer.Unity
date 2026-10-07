@@ -33,16 +33,26 @@ namespace BITKit.Multiplayer.Unity
         public UnityNetworkObjects AttachNetworkObjects(uint worldGeneration, uint localPeerId,
             INetworkPrefabLoader prefabLoader)
         {
+            return AttachNetworkObjects(worldGeneration, localPeerId, prefabLoader,
+                Runtime.Entities ?? throw new InvalidOperationException(
+                    "Attach the application's IEntitiesService to Runtime before attaching network objects."));
+        }
+
+        public UnityNetworkObjects AttachNetworkObjects(uint worldGeneration, uint localPeerId,
+            INetworkPrefabLoader prefabLoader, IEntitiesService entities, bool registerLoadedSceneObjects = true)
+        {
             if (_disposed) throw new ObjectDisposedException(nameof(UnityNetRpcAdapter));
+            Dispatcher.VerifyMainThread();
             if (_networkObjects != null) throw new InvalidOperationException("A Unity network-object world is already attached.");
-            var context = new RpcContext<UnityNetworkObjects>(Runtime);
-            UnityNetworkObjects objects;
-            try { objects = new UnityNetworkObjects(Runtime, prefabLoader, worldGeneration, localPeerId, Lifetime, context); }
-            catch { context.Dispose(); throw; }
+            if (entities == null) throw new ArgumentNullException(nameof(entities));
+            if (!ReferenceEquals(Runtime.Entities, entities))
+                throw new InvalidOperationException("Network objects must use the IEntitiesService already attached to this Runtime.");
+            var objects = new UnityNetworkObjects(Runtime, prefabLoader, entities,
+                worldGeneration, localPeerId, Lifetime, Dispatcher);
             objects.Faulted += Report;
             try
             {
-                objects.RegisterLoadedSceneObjects();
+                if (registerLoadedSceneObjects) objects.RegisterLoadedSceneObjects();
                 _networkObjects = objects;
                 return objects;
             }
@@ -56,11 +66,12 @@ namespace BITKit.Multiplayer.Unity
 
         public void DetachNetworkObjects()
         {
+            Dispatcher.VerifyMainThread();
             var objects = _networkObjects;
             if (objects == null) return;
             _networkObjects = null;
-            objects.Faulted -= Report;
-            objects.Dispose();
+            try { objects.Dispose(); }
+            finally { objects.Faulted -= Report; }
         }
 
         public void AttachPeer(uint peer, NetRpcTransport transport, ITransportLifetime life, IAsyncDisposable connectionOwner = null)

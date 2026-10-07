@@ -1,19 +1,26 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using BITKit.Multiplayer.NetRpc;
 using Cysharp.Threading.Tasks;
 using UnityEngine;
+using CoreHandle = BITKit.Multiplayer.NetRpc.NetworkObjectHandle;
+using CoreKind = BITKit.Multiplayer.NetRpc.NetworkObjectKind;
+using CoreState = BITKit.Multiplayer.NetRpc.NetworkObjectState;
 
 namespace BITKit.Multiplayer.Unity
 {
+    // Source-only compatibility DTOs. Core types own the new wire contract.
+    [Obsolete("Use BITKit.Multiplayer.NetRpc.NetworkObjectKind.")]
     public enum NetworkObjectKind : byte
     {
         Prefab = 1,
         Scene = 2
     }
 
+    [Obsolete("Use BITKit.Multiplayer.NetRpc.NetworkObjectState. This compatibility DTO is not the wire contract.")]
     public sealed class NetworkObjectState
     {
         public uint EntityId { get; set; }
@@ -35,6 +42,7 @@ namespace BITKit.Multiplayer.Unity
         internal NetworkObjectState Copy() => (NetworkObjectState)MemberwiseClone();
     }
 
+    [Obsolete("Use BITKit.Multiplayer.NetRpc.NetworkObjectSnapshot. This compatibility DTO is not the wire contract.")]
     public sealed class NetworkObjectSnapshot
     {
         public uint WorldGeneration { get; set; }
@@ -50,381 +58,206 @@ namespace BITKit.Multiplayer.Unity
         void Release(GameObject instance);
     }
 
+    /// <summary>Unity view of a Core-owned object lease; it does not own a second roster.</summary>
     public sealed class NetworkGameObjectHandle
     {
-        internal NetworkGameObjectHandle(NetworkObjectState state, GameObject gameObject,
-            IUnityNetworkIdentity identity, bool authority)
-        {
-            State = state;
-            GameObject = gameObject;
-            Identity = identity;
-            IsAuthority = authority;
-        }
+        private readonly CoreHandle _handle;
+        internal NetworkGameObjectHandle(CoreHandle handle) => _handle = handle;
+        public uint EntityId => _handle.EntityId;
+        public uint OwnerPeerId => _handle.OwnerPeerId;
+        public GameObject GameObject => (GameObject)_handle.Instance;
+        public IUnityNetworkIdentity Identity => (IUnityNetworkIdentity)_handle.Identity;
+        public NetEntity Entity => _handle.Entity;
+        public bool IsAuthority => _handle.IsAuthority;
+        public bool IsOwner(uint localPeerId) => _handle.IsOwner(localPeerId);
+        public bool IsSceneObject => _handle.IsSceneObject;
+        public string SceneKey => _handle.SceneKey;
+        public string PrefabAddress => _handle.PrefabAddress;
 
-        internal NetworkObjectState State { get; set; }
-        public uint EntityId => State.EntityId;
-        public uint OwnerPeerId => State.OwnerPeerId;
-        public GameObject GameObject { get; }
-        public IUnityNetworkIdentity Identity { get; }
-        public bool IsAuthority { get; }
-        public bool IsOwner(uint localPeerId) => localPeerId != 0 && State.OwnerPeerId == localPeerId;
-        public bool IsSceneObject => State.Kind == NetworkObjectKind.Scene;
-        public string SceneKey => State.SceneKey;
-        public string PrefabAddress => State.Address;
+        /// <summary>
+        /// Call during Initializing to attach the application's entity scope. Core registers it after
+        /// all callbacks finish, and unregisters it before releasing Unity. Do not also register it manually.
+        /// </summary>
+        public void AttachEntity(NetEntity entity) => _handle.AttachEntity(entity);
     }
 
     /// <summary>
-    /// One world-generation roster. The Host owns IDs/lifecycle; Clients resolve NetworkIdentity prefab addresses
-    /// and bind authored SceneIdentity objects before NetEntity component synchronization is exposed.
+    /// Main-thread facade over NetworkObjectService. Core owns the protocol, roster, IDs,
+    /// generation/revision checks, authority, ownership and entity registration.
     /// </summary>
-    [global::BITKit.Multiplayer.NetRpcBackend]
     public sealed class UnityNetworkObjects : IDisposable
     {
-        private readonly RpcContextService _runtime;
-        private readonly IRpcContext<UnityNetworkObjects> _rpcContext;
-        private readonly INetworkPrefabLoader _loader;
-        private readonly CancellationTokenSource _lifetime;
-        private readonly Dictionary<uint, NetworkObjectState> _states = new Dictionary<uint, NetworkObjectState>();
-        private readonly Dictionary<uint, NetworkGameObjectHandle> _objects = new Dictionary<uint, NetworkGameObjectHandle>();
-        private readonly Dictionary<string, GameObject> _sceneObjects = new Dictionary<string, GameObject>(StringComparer.Ordinal);
-        private readonly HashSet<uint> _loading = new HashSet<uint>();
-        private uint _nextEntityId;
-        private ulong _revision;
+        private readonly UnityNetRpcDispatcher _dispatcher;
+        private readonly UnityObjectAdapter _adapter;
+        private readonly ConditionalWeakTable<CoreHandle, NetworkGameObjectHandle> _handles =
+            new ConditionalWeakTable<CoreHandle, NetworkGameObjectHandle>();
         private bool _disposed;
 
         internal UnityNetworkObjects(RpcContextService runtime, INetworkPrefabLoader loader,
-            uint worldGeneration, uint localPeerId, CancellationToken sessionLifetime,
-            IRpcContext<UnityNetworkObjects> rpcContext)
+            IEntitiesService entities, uint worldGeneration, uint localPeerId,
+            CancellationToken sessionLifetime, UnityNetRpcDispatcher dispatcher)
         {
-            _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
-            _rpcContext = rpcContext ?? throw new ArgumentNullException(nameof(rpcContext));
-            _loader = loader ?? throw new ArgumentNullException(nameof(loader));
-            if (worldGeneration == 0) throw new ArgumentOutOfRangeException(nameof(worldGeneration));
-            if (localPeerId == 0) throw new ArgumentOutOfRangeException(nameof(localPeerId));
-            WorldGeneration = worldGeneration;
-            LocalPeerId = localPeerId;
-            _lifetime = CancellationTokenSource.CreateLinkedTokenSource(sessionLifetime);
+            _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+            _dispatcher.VerifyMainThread();
+            _adapter = new UnityObjectAdapter(loader, dispatcher);
+            Core = new NetworkObjectService(runtime, _adapter, entities, worldGeneration, localPeerId, sessionLifetime);
+            Core.Initializing += Initialize;
+            Core.Spawned += OnSpawned;
+            Core.Despawning += OnDespawning;
+            Core.Faulted += Report;
         }
 
-        public bool IsAuthority => _runtime.IsServer;
-        public uint WorldGeneration { get; }
-        public uint LocalPeerId { get; }
-        public IReadOnlyCollection<NetworkGameObjectHandle> Objects => _objects.Values;
+        public NetworkObjectService Core { get; }
+        public bool IsAuthority => Core.IsAuthority;
+        public uint WorldGeneration => Core.WorldGeneration;
+        public uint LocalPeerId => Core.LocalPeerId;
+        public IReadOnlyCollection<NetworkGameObjectHandle> Objects => Core.Objects.Select(Wrap).ToArray();
         public event Func<NetworkGameObjectHandle, CancellationToken, UniTask> Initializing;
         public event Action<NetworkGameObjectHandle> Spawned;
         public event Action<NetworkGameObjectHandle> Despawning;
         public event Action<Exception> Faulted;
 
+        /// <summary>Starts registration. Await the async variant if Initializing callbacks can await.</summary>
         public void RegisterLoadedSceneObjects()
         {
-            ThrowIfDisposed();
-            foreach (var identity in Resources.FindObjectsOfTypeAll<SceneIdentity>())
-                if (identity && identity.gameObject.scene.isLoaded &&
-                    (identity.hideFlags & (HideFlags.NotEditable | HideFlags.HideAndDontSave)) == 0)
-                    RegisterSceneObject(identity.gameObject, false);
+            VerifyAccess();
+            var instances = DiscoverSceneObjects();
+            RegisterScenes(instances, CancellationToken.None).Forget(Report);
         }
 
-        public NetworkGameObjectHandle RegisterSceneObject(GameObject instance) =>
-            RegisterSceneObject(instance, true);
-
-        private NetworkGameObjectHandle RegisterSceneObject(GameObject instance, bool announce)
+        public UniTask RegisterLoadedSceneObjectsAsync(CancellationToken cancellationToken = default)
         {
-            ThrowIfDisposed();
-            if (!instance || !instance.scene.isLoaded)
-                throw new ArgumentException("A loaded scene object is required.", nameof(instance));
-            var identity = instance.GetComponent<SceneIdentity>() ??
-                throw new ArgumentException("Scene object requires SceneIdentity.", nameof(instance));
-            var key = SceneIdentity.NameKey(instance.transform);
-            if (string.IsNullOrWhiteSpace(key))
-                throw new InvalidOperationException("SceneIdentity requires a saved, loaded scene.");
-            if (_sceneObjects.TryGetValue(key, out var existing) && existing != instance)
-                throw new InvalidOperationException("Duplicate SceneIdentity key: " + key);
-            _sceneObjects[key] = instance;
+            VerifyAccess();
+            return RegisterScenes(DiscoverSceneObjects(), cancellationToken);
+        }
 
-            var state = _states.Values.FirstOrDefault(value =>
-                value.Kind == NetworkObjectKind.Scene && string.Equals(value.SceneKey, key, StringComparison.Ordinal));
-            if (state == null && IsAuthority)
+        private GameObject[] DiscoverSceneObjects()
+        {
+            var instances = Resources.FindObjectsOfTypeAll<SceneIdentity>()
+                .Where(identity => identity && identity.gameObject.scene.isLoaded &&
+                    (identity.hideFlags & (HideFlags.NotEditable | HideFlags.HideAndDontSave)) == 0)
+                .Select(identity => identity.gameObject).ToArray();
+            foreach (var instance in instances) _adapter.RegisterScene(instance);
+            return instances;
+        }
+
+        private async UniTask RegisterScenes(GameObject[] instances, CancellationToken cancellationToken)
+        {
+            foreach (var instance in instances)
+                await RegisterSceneObjectAsync(instance, cancellationToken);
+        }
+
+        /// <summary>
+        /// Returns null while async initialization or remote scene state is pending.
+        /// Await RegisterSceneObjectAsync or observe Spawned when completion is required.
+        /// </summary>
+        public NetworkGameObjectHandle RegisterSceneObject(GameObject instance)
+        {
+            var pending = RegisterSceneObjectAsync(instance);
+            if (pending.Status.IsCompleted()) return pending.GetAwaiter().GetResult();
+            ObserveSceneRegistration(pending).Forget(Report);
+            return null;
+        }
+
+        private static async UniTask ObserveSceneRegistration(UniTask<NetworkGameObjectHandle> pending)
+        {
+            await pending;
+        }
+
+        public async UniTask<NetworkGameObjectHandle> RegisterSceneObjectAsync(GameObject instance,
+            CancellationToken cancellationToken = default)
+        {
+            VerifyAccess();
+            cancellationToken.ThrowIfCancellationRequested();
+            var key = _adapter.RegisterScene(instance);
+            if (IsAuthority)
             {
-                state = CreateState(NetworkObjectKind.Scene, null, key, instance.transform,
-                    0, instance.activeSelf);
-                _states.Add(state.EntityId, state);
+                var state = CreateTemplate(CoreKind.Scene, null, key, instance.transform.position,
+                    instance.transform.rotation, 0, instance.activeSelf);
+                var lease = new NetworkObjectInstance(instance, instance.GetComponent<SceneIdentity>());
+                return Wrap(await Core.SpawnAsync(state, lease, cancellationToken));
             }
-            if (state == null) return null;
-            var handle = BindScene(state, instance, identity);
-            if (announce && IsAuthority) RpcUpsert(state.Copy());
-            return handle;
+            await Core.RetryPendingAsync(cancellationToken);
+            var handle = Core.Objects.FirstOrDefault(value => value.IsSceneObject &&
+                string.Equals(value.SceneKey, key, StringComparison.Ordinal));
+            return handle == null ? null : Wrap(handle);
         }
 
         public async UniTask<NetworkGameObjectHandle> SpawnAsync(GameObject prefab, Vector3 position,
             Quaternion rotation, uint ownerPeerId = 0, CancellationToken cancellationToken = default)
         {
-            ThrowIfDisposed();
+            VerifyAccess();
+            cancellationToken.ThrowIfCancellationRequested();
             if (!IsAuthority) throw new RpcException(RpcError.InvalidRole, "Only Host may spawn network objects.");
             if (!prefab) throw new ArgumentNullException(nameof(prefab));
             var metadata = prefab.GetComponent<NetworkIdentity>();
             if (!metadata || string.IsNullOrWhiteSpace(metadata.PrefabAddress))
                 throw new InvalidOperationException("Network prefab requires NetworkIdentity.PrefabAddress.");
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
-            var state = CreateState(NetworkObjectKind.Prefab, metadata.PrefabAddress.Trim(), null,
+            var state = CreateTemplate(CoreKind.Prefab, metadata.PrefabAddress.Trim(), null,
                 position, rotation, ownerPeerId, true);
-            var instance = UnityEngine.Object.Instantiate(prefab, position, rotation);
-            NetworkGameObjectHandle handle = null;
-            try
-            {
-                handle = await BindDynamic(state, instance, linked.Token);
-                _states.Add(state.EntityId, state);
-                RpcUpsert(state.Copy());
-                return handle;
-            }
-            catch
-            {
-                if (handle != null) _objects.Remove(state.EntityId);
-                if (instance) _loader.Release(instance);
-                throw;
-            }
+            var lease = _adapter.InstantiatePrefab(prefab, position, rotation);
+            // Core owns the supplied lease from this call, including failure and cancellation cleanup.
+            return Wrap(await Core.SpawnAsync(state, lease, cancellationToken));
         }
 
-        public async UniTask SynchronizeAsync(CancellationToken cancellationToken = default)
+        public UniTask SynchronizeAsync(CancellationToken cancellationToken = default)
         {
-            ThrowIfDisposed();
-            if (IsAuthority) throw new RpcException(RpcError.InvalidRole, "Host already owns the object roster.");
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
-            var snapshot = await RpcReadSnapshot(WorldGeneration);
-            linked.Token.ThrowIfCancellationRequested();
-            if (snapshot == null || snapshot.WorldGeneration != WorldGeneration)
-                throw new RpcException(RpcError.InvalidPayload, "Network object snapshot generation mismatch.");
+            VerifyAccess();
+            return Core.SynchronizeAsync(cancellationToken);
+        }
 
-            var included = new HashSet<uint>();
-            foreach (var state in snapshot.Objects ?? Array.Empty<NetworkObjectState>())
-            {
-                included.Add(state.EntityId);
-                await ApplyState(state, linked.Token);
-            }
-            foreach (var stale in _states.Values.Where(state => state.Revision <= snapshot.Revision &&
-                         !included.Contains(state.EntityId)).Select(state => state.EntityId).ToArray())
-                RemoveLocal(stale);
-            _revision = Math.Max(_revision, snapshot.Revision);
+        public UniTask RetryPendingAsync(CancellationToken cancellationToken = default)
+        {
+            VerifyAccess();
+            return Core.RetryPendingAsync(cancellationToken);
         }
 
         public void SetOwner(uint entityId, uint ownerPeerId)
         {
-            ThrowIfDisposed();
-            if (!IsAuthority) throw new RpcException(RpcError.InvalidRole, "Only Host may change ownership.");
-            if (!_states.TryGetValue(entityId, out var state))
-                throw new KeyNotFoundException("Network object is not registered.");
-            state.OwnerPeerId = ownerPeerId;
-            state.Revision = NextRevision();
-            ApplyOwner(state);
-            RpcSetOwner(WorldGeneration, entityId, ownerPeerId, state.Revision);
+            VerifyAccess();
+            Core.SetOwner(entityId, ownerPeerId);
         }
 
         public UniTask DespawnAsync(uint entityId, CancellationToken cancellationToken = default)
         {
-            ThrowIfDisposed();
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!IsAuthority) throw new RpcException(RpcError.InvalidRole, "Only Host may despawn network objects.");
-            if (!_states.ContainsKey(entityId)) return UniTask.CompletedTask;
-            var revision = NextRevision();
-            RemoveLocal(entityId);
-            RpcRemove(WorldGeneration, entityId, revision);
-            return UniTask.CompletedTask;
+            VerifyAccess();
+            return Core.DespawnAsync(entityId, cancellationToken);
         }
 
-        public bool TryGet(uint entityId, out NetworkGameObjectHandle handle) =>
-            _objects.TryGetValue(entityId, out handle);
-
-        public bool Owns(uint entityId) =>
-            _states.TryGetValue(entityId, out var state) && state.OwnerPeerId == LocalPeerId;
-
-        [global::BITKit.Multiplayer.Rpc(global::BITKit.Multiplayer.SendTo.Host)]
-        private UniTask<NetworkObjectSnapshot> RpcReadSnapshot(uint worldGeneration)
+        public bool TryGet(uint entityId, out NetworkGameObjectHandle handle)
         {
-            if (!IsAuthority || worldGeneration != WorldGeneration)
-                throw new RpcException(RpcError.InvalidPayload, "Network object snapshot generation mismatch.");
-            return UniTask.FromResult(new NetworkObjectSnapshot
+            if (Core.TryGet(entityId, out var coreHandle)) { handle = Wrap(coreHandle); return true; }
+            handle = null;
+            return false;
+        }
+
+        public bool Owns(uint entityId) => Core.Owns(entityId);
+        private NetworkGameObjectHandle Wrap(CoreHandle handle) =>
+            _handles.GetValue(handle, value => new NetworkGameObjectHandle(value));
+
+        private async UniTask Initialize(CoreHandle handle, CancellationToken cancellationToken)
+        {
+            await _dispatcher.SwitchToMainThreadAsync();
+            var callbacks = Initializing;
+            if (callbacks == null) return;
+            foreach (Func<NetworkGameObjectHandle, CancellationToken, UniTask> callback in callbacks.GetInvocationList())
             {
-                WorldGeneration = WorldGeneration,
-                Revision = _revision,
-                Objects = _states.Values.OrderBy(state => state.EntityId).Select(state => state.Copy()).ToArray()
-            });
-        }
-
-        [global::BITKit.Multiplayer.Rpc(global::BITKit.Multiplayer.SendTo.All)]
-        private void RpcUpsert(NetworkObjectState state)
-        {
-            if (_disposed || state == null || state.WorldGeneration != WorldGeneration ||
-                state.EntityId == 0 || state.Revision == 0 || state.Revision <= _revision) return;
-            ApplyState(state, _lifetime.Token).Forget(Report);
-        }
-
-        [global::BITKit.Multiplayer.Rpc(global::BITKit.Multiplayer.SendTo.All)]
-        private void RpcSetOwner(uint worldGeneration, uint entityId, uint ownerPeerId, ulong revision)
-        {
-            if (_disposed || worldGeneration != WorldGeneration || revision <= _revision) return;
-            _revision = revision;
-            if (!_states.TryGetValue(entityId, out var state)) return;
-            state.OwnerPeerId = ownerPeerId;
-            state.Revision = revision;
-            ApplyOwner(state);
-        }
-
-        [global::BITKit.Multiplayer.Rpc(global::BITKit.Multiplayer.SendTo.All)]
-        private void RpcRemove(uint worldGeneration, uint entityId, ulong revision)
-        {
-            if (_disposed || worldGeneration != WorldGeneration || revision <= _revision) return;
-            _revision = revision;
-            RemoveLocal(entityId);
-        }
-
-        private async UniTask ApplyState(NetworkObjectState incoming, CancellationToken cancellationToken)
-        {
-            Validate(incoming);
-            if (_states.TryGetValue(incoming.EntityId, out var current) && current.Revision >= incoming.Revision)
-                return;
-            var state = incoming.Copy();
-            _states[state.EntityId] = state;
-            _revision = Math.Max(_revision, state.Revision);
-            if (_objects.TryGetValue(state.EntityId, out var existing))
-            {
-                existing.State = state;
-                ApplyOwner(state);
-                existing.GameObject.SetActive(state.Active);
-                return;
+                try { await callback(Wrap(handle), cancellationToken); }
+                finally { await _dispatcher.SwitchToMainThreadAsync(); }
+                cancellationToken.ThrowIfCancellationRequested();
             }
-            if (state.Kind == NetworkObjectKind.Scene)
-            {
-                if (_sceneObjects.TryGetValue(state.SceneKey, out var sceneObject) && sceneObject)
-                    BindScene(state, sceneObject, sceneObject.GetComponent<SceneIdentity>());
-                return;
-            }
-            if (!_loading.Add(state.EntityId)) return;
-            GameObject instance = null;
-            try
-            {
-                instance = await _loader.InstantiateAsync(state.Address, Position(state), Rotation(state), cancellationToken);
-                if (!instance) throw new InvalidOperationException("Prefab loader returned no GameObject for " + state.Address);
-                if (!_states.TryGetValue(state.EntityId, out var latest) || latest.Revision != state.Revision)
-                {
-                    _loader.Release(instance);
-                    return;
-                }
-                await BindDynamic(latest, instance, cancellationToken);
-            }
-            catch
-            {
-                if (instance && !_objects.ContainsKey(state.EntityId)) _loader.Release(instance);
-                throw;
-            }
-            finally { _loading.Remove(state.EntityId); }
         }
 
-        private NetworkGameObjectHandle BindScene(NetworkObjectState state, GameObject instance,
-            SceneIdentity identity)
+        private void OnSpawned(CoreHandle handle)
         {
-            if (_objects.TryGetValue(state.EntityId, out var existing)) return existing;
-            if (!identity) throw new InvalidOperationException("Scene object lost its SceneIdentity.");
-            identity.Bind(state.EntityId, state.OwnerPeerId, IsAuthority);
-            instance.transform.SetPositionAndRotation(Position(state), Rotation(state));
-            instance.SetActive(state.Active);
-            var handle = new NetworkGameObjectHandle(state, instance, identity, IsAuthority);
-            _objects[state.EntityId] = handle;
-            Spawned?.Invoke(handle);
-            return handle;
+            _dispatcher.VerifyMainThread();
+            Spawned?.Invoke(Wrap(handle));
         }
 
-        private async UniTask<NetworkGameObjectHandle> BindDynamic(NetworkObjectState state,
-            GameObject instance, CancellationToken cancellationToken)
+        private void OnDespawning(CoreHandle handle)
         {
-            var identity = instance.GetComponent<NetworkIdentity>() ??
-                throw new InvalidOperationException("Loaded network prefab requires NetworkIdentity.");
-            identity.Bind(state.EntityId, state.OwnerPeerId, IsAuthority);
-            instance.transform.SetPositionAndRotation(Position(state), Rotation(state));
-            instance.SetActive(state.Active);
-            var handle = new NetworkGameObjectHandle(state, instance, identity, IsAuthority);
-            if (Initializing != null)
-                foreach (Func<NetworkGameObjectHandle, CancellationToken, UniTask> callback in Initializing.GetInvocationList())
-                    await callback(handle, cancellationToken);
-            _objects[state.EntityId] = handle;
-            Spawned?.Invoke(handle);
-            return handle;
-        }
-
-        private void ApplyOwner(NetworkObjectState state)
-        {
-            if (!_objects.TryGetValue(state.EntityId, out var handle)) return;
-            handle.State = state;
-            if (handle.Identity is NetworkIdentity dynamicIdentity) dynamicIdentity.SetOwner(state.OwnerPeerId);
-            else if (handle.Identity is SceneIdentity sceneIdentity) sceneIdentity.SetOwner(state.OwnerPeerId);
-        }
-
-        private NetworkObjectState CreateState(NetworkObjectKind kind, string address, string sceneKey,
-            Transform transform, uint ownerPeerId, bool active) =>
-            CreateState(kind, address, sceneKey, transform.position, transform.rotation, ownerPeerId, active);
-
-        private NetworkObjectState CreateState(NetworkObjectKind kind, string address, string sceneKey,
-            Vector3 position, Quaternion rotation, uint ownerPeerId, bool active) => new NetworkObjectState
-        {
-            EntityId = NextEntityId(),
-            OwnerPeerId = ownerPeerId,
-            WorldGeneration = WorldGeneration,
-            Revision = NextRevision(),
-            Kind = kind,
-            Address = address,
-            SceneKey = sceneKey,
-            PositionX = position.x,
-            PositionY = position.y,
-            PositionZ = position.z,
-            RotationX = rotation.x,
-            RotationY = rotation.y,
-            RotationZ = rotation.z,
-            RotationW = rotation.w,
-            Active = active
-        };
-
-        private uint NextEntityId()
-        {
-            if (_nextEntityId == uint.MaxValue)
-                throw new RpcException(RpcError.LimitExceeded, "Network entity ID space exhausted.");
-            return ++_nextEntityId;
-        }
-
-        private ulong NextRevision()
-        {
-            if (_revision == ulong.MaxValue)
-                throw new RpcException(RpcError.LimitExceeded, "Network object revision exhausted.");
-            return ++_revision;
-        }
-
-        private static Vector3 Position(NetworkObjectState state) =>
-            new Vector3(state.PositionX, state.PositionY, state.PositionZ);
-
-        private static Quaternion Rotation(NetworkObjectState state) =>
-            new Quaternion(state.RotationX, state.RotationY, state.RotationZ, state.RotationW);
-
-        private void Validate(NetworkObjectState state)
-        {
-            if (state == null || state.EntityId == 0 || state.WorldGeneration != WorldGeneration || state.Revision == 0 ||
-                !Enum.IsDefined(typeof(NetworkObjectKind), state.Kind) ||
-                state.Kind == NetworkObjectKind.Prefab && string.IsNullOrWhiteSpace(state.Address) ||
-                state.Kind == NetworkObjectKind.Scene && string.IsNullOrWhiteSpace(state.SceneKey) ||
-                !float.IsFinite(state.PositionX) || !float.IsFinite(state.PositionY) || !float.IsFinite(state.PositionZ) ||
-                !float.IsFinite(state.RotationX) || !float.IsFinite(state.RotationY) ||
-                !float.IsFinite(state.RotationZ) || !float.IsFinite(state.RotationW))
-                throw new RpcException(RpcError.InvalidPayload, "Invalid network object state.");
-        }
-
-        private void RemoveLocal(uint entityId)
-        {
-            _states.Remove(entityId);
-            if (!_objects.Remove(entityId, out var handle)) return;
-            Despawning?.Invoke(handle);
-            if (handle.Identity is NetworkIdentity dynamicIdentity) dynamicIdentity.Clear();
-            else if (handle.Identity is SceneIdentity sceneIdentity) sceneIdentity.Clear();
-            if (handle.IsSceneObject)
-            {
-                if (handle.GameObject) handle.GameObject.SetActive(false);
-            }
-            else if (handle.GameObject) _loader.Release(handle.GameObject);
+            _dispatcher.VerifyMainThread();
+            Despawning?.Invoke(Wrap(handle));
         }
 
         private void Report(Exception error)
@@ -432,22 +265,171 @@ namespace BITKit.Multiplayer.Unity
             if (!_disposed) Faulted?.Invoke(error);
         }
 
-        private void ThrowIfDisposed()
+        private void VerifyAccess()
         {
+            _dispatcher.VerifyMainThread();
             if (_disposed) throw new ObjectDisposedException(nameof(UnityNetworkObjects));
         }
 
         public void Dispose()
         {
             if (_disposed) return;
-            _disposed = true;
-            _rpcContext.Dispose();
-            _lifetime.Cancel();
-            foreach (var entityId in _objects.Keys.ToArray()) RemoveLocal(entityId);
-            _states.Clear();
-            _sceneObjects.Clear();
-            _loading.Clear();
-            _lifetime.Dispose();
+            _dispatcher.VerifyMainThread();
+            try { Core.Dispose(); }
+            finally
+            {
+                _disposed = true;
+                Core.Initializing -= Initialize;
+                Core.Spawned -= OnSpawned;
+                Core.Despawning -= OnDespawning;
+                Core.Faulted -= Report;
+                _adapter.ClearSceneMap();
+            }
+        }
+
+        private static CoreState CreateTemplate(CoreKind kind, string address, string sceneKey,
+            Vector3 position, Quaternion rotation, uint ownerPeerId, bool active) => new CoreState
+        {
+            Kind = kind, Address = address, SceneKey = sceneKey, OwnerPeerId = ownerPeerId,
+            PositionX = position.x, PositionY = position.y, PositionZ = position.z,
+            RotationX = rotation.x, RotationY = rotation.y, RotationZ = rotation.z, RotationW = rotation.w,
+            Active = active
+        };
+
+        private sealed class UnityObjectAdapter : INetworkObjectAdapter, INetworkObjectDispatcher
+        {
+            private readonly INetworkPrefabLoader _loader;
+            private readonly UnityNetRpcDispatcher _dispatcher;
+            private readonly Dictionary<string, GameObject> _scenes =
+                new Dictionary<string, GameObject>(StringComparer.Ordinal);
+
+            internal UnityObjectAdapter(INetworkPrefabLoader loader, UnityNetRpcDispatcher dispatcher)
+            {
+                _loader = loader ?? throw new ArgumentNullException(nameof(loader));
+                _dispatcher = dispatcher;
+            }
+
+            public async UniTask SwitchToEngineThreadAsync(CancellationToken cancellationToken)
+            {
+                await _dispatcher.SwitchToMainThreadAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            internal string RegisterScene(GameObject instance)
+            {
+                _dispatcher.VerifyMainThread();
+                if (!instance || !instance.scene.isLoaded)
+                    throw new ArgumentException("A loaded scene object is required.", nameof(instance));
+                if (!instance.GetComponent<SceneIdentity>())
+                    throw new ArgumentException("Scene object requires SceneIdentity.", nameof(instance));
+                var key = SceneIdentity.NameKey(instance.transform);
+                if (string.IsNullOrWhiteSpace(key))
+                    throw new InvalidOperationException("SceneIdentity requires a saved, loaded scene.");
+                if (_scenes.TryGetValue(key, out var existing) && existing && existing != instance)
+                    throw new InvalidOperationException("Duplicate SceneIdentity key: " + key);
+                _scenes[key] = instance;
+                return key;
+            }
+
+            internal void ClearSceneMap() => _scenes.Clear();
+
+            internal NetworkObjectInstance InstantiatePrefab(GameObject prefab, Vector3 position, Quaternion rotation)
+            {
+                _dispatcher.VerifyMainThread();
+                var instance = UnityEngine.Object.Instantiate(prefab, position, rotation);
+                try
+                {
+                    if (!instance) throw new InvalidOperationException("Unity did not create the network prefab.");
+                    var identity = instance.GetComponent<NetworkIdentity>();
+                    if (!identity) throw new InvalidOperationException("Instantiated network prefab lost its NetworkIdentity.");
+                    return new NetworkObjectInstance(instance, identity);
+                }
+                catch
+                {
+                    if (instance) _loader.Release(instance);
+                    throw;
+                }
+            }
+
+            public async UniTask<NetworkObjectInstance> InstantiateAsync(CoreState state,
+                CancellationToken cancellationToken)
+            {
+                await SwitchToEngineThreadAsync(cancellationToken);
+                if (state.Kind == CoreKind.Scene)
+                {
+                    if (!_scenes.TryGetValue(state.SceneKey, out var scene) || !scene) return null;
+                    var identity = scene.GetComponent<SceneIdentity>();
+                    if (!identity) throw new InvalidOperationException("Scene object lost its SceneIdentity.");
+                    return new NetworkObjectInstance(scene, identity);
+                }
+                GameObject instance = null;
+                try
+                {
+                    try
+                    {
+                        instance = await _loader.InstantiateAsync(state.Address, Position(state),
+                            Rotation(state), cancellationToken);
+                    }
+                    finally { await _dispatcher.SwitchToMainThreadAsync(); }
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!instance)
+                        throw new InvalidOperationException("Prefab loader returned no GameObject for " + state.Address);
+                    var identity = instance.GetComponent<NetworkIdentity>();
+                    if (!identity) throw new InvalidOperationException("Loaded network prefab requires NetworkIdentity.");
+                    return new NetworkObjectInstance(instance, identity);
+                }
+                catch
+                {
+                    _dispatcher.VerifyMainThread();
+                    if (instance) _loader.Release(instance);
+                    throw;
+                }
+            }
+
+            public void Bind(NetworkObjectInstance lease, CoreState state, bool authority)
+            {
+                _dispatcher.VerifyMainThread();
+                var instance = (GameObject)lease.Instance;
+                if (!instance) throw new InvalidOperationException("Network GameObject was destroyed before binding.");
+                // Gameplay activation is deferred until Core has registered and applied initial entity state.
+                instance.SetActive(false);
+                if (lease.Identity is NetworkIdentity prefab) prefab.Bind(state.EntityId, state.OwnerPeerId, authority);
+                else if (lease.Identity is SceneIdentity scene) scene.Bind(state.EntityId, state.OwnerPeerId, authority);
+                else throw new InvalidOperationException("Unity lease requires a Unity network identity.");
+                instance.transform.SetPositionAndRotation(Position(state), Rotation(state));
+            }
+
+            public void ApplyState(NetworkObjectInstance lease, CoreState state)
+            {
+                _dispatcher.VerifyMainThread();
+                var instance = (GameObject)lease.Instance;
+                if (!instance) throw new InvalidOperationException("Network GameObject was destroyed outside its object service.");
+                if (lease.Identity.EntityId != state.EntityId)
+                    throw new InvalidOperationException("Network identity no longer belongs to this object lease.");
+                if (lease.Identity is NetworkIdentity prefab) prefab.SetOwner(state.OwnerPeerId);
+                else if (lease.Identity is SceneIdentity scene) scene.SetOwner(state.OwnerPeerId);
+                instance.SetActive(state.Active);
+            }
+
+            public void Release(NetworkObjectInstance lease, CoreState state)
+            {
+                _dispatcher.VerifyMainThread();
+                var instance = (GameObject)lease.Instance;
+                if (!instance) return;
+                // An old, cancellation-ignoring initialization can finish after the authored scene
+                // object has been bound by a new lease. Never clear or deactivate that newer binding.
+                var boundId = lease.Identity.EntityId;
+                if (boundId != 0 && boundId != state.EntityId) return;
+                if (lease.Identity is NetworkIdentity prefab) prefab.Clear();
+                else if (lease.Identity is SceneIdentity scene) scene.Clear();
+                if (state.Kind == CoreKind.Scene) instance.SetActive(false);
+                else _loader.Release(instance);
+            }
+
+            private static Vector3 Position(CoreState state) =>
+                new Vector3(state.PositionX, state.PositionY, state.PositionZ);
+            private static Quaternion Rotation(CoreState state) =>
+                new Quaternion(state.RotationX, state.RotationY, state.RotationZ, state.RotationW);
         }
     }
 }
